@@ -1,0 +1,10 @@
+[env]
+_.python.venv = { path = ".venv", create = true }
+PYTHONPATH = "{{config_root}}"
+
+[tasks.setup]
+run = """
+pip install --upgrade pip
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+pip install transformers==5.14.1 numpy matplotlib datasets accelerate
+"""
