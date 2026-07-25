@@ -12,6 +12,10 @@ What each check answers:
   attention shape   : are q_norm/k_norm still Qwen3RMSNorm sized to head_dim?
   attention source  : does Qwen3Attention.forward still order things the way
                       the capture script assumes (norm before RoPE, etc.)?
+  row entropy       : does _row_entropy match closed-form entropy on known
+                      distributions (flat -> log n, near-one-hot -> 0)?
+  quant roundtrip   : does symmetric per-tensor quantization stay within a
+                      half-step and grow with coarser bits?
 
 Run:  python tests/test_qk_norm.py
 """
@@ -24,6 +28,7 @@ sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 import rmsnorm_mechanism as rms
 import capture_qk_stats as cap
+import quant_sensitivity as qs
 
 
 def test_rms_matches_qwen3():
@@ -46,6 +51,14 @@ def test_attention_source():
     cap.assert_qknorm_unchanged()
 
 
+def test_row_entropy():
+    cap.assert_row_entropy_correct()
+
+
+def test_quant_roundtrip():
+    qs.assert_quant_roundtrip_correct()
+
+
 def main():
     # demo_per_head_axis and the source inspections print to stdout; silence
     # them so a passing run says nothing.
@@ -57,6 +70,8 @@ def main():
         test_rms_properties,
         test_attention_shape,
         test_attention_source,
+        test_row_entropy,
+        test_quant_roundtrip,
     ]
     with contextlib.redirect_stdout(io.StringIO()):
         for check in checks:

@@ -74,6 +74,11 @@ LONG_DOC_CONFIG = "wikitext-103-raw-v1"
 
 FP16_MAX = 65504.0
 
+# Entropy is only counted for query rows with at least this many attendable
+# keys. Rows earlier than this attend to too few keys for a low entropy to mean
+# anything other than causal short-context. See _logit_stats.
+ENTROPY_MIN_CONTEXT = 32
+
 
 # ---------------------------------------------------------------------------
 # Drift guard
@@ -191,6 +196,56 @@ def _norm_stats(t):
     }
 
 
+def _row_entropy(logits, keep_b):
+    """Per-row attention entropy in nats, for one chunk of query rows.
+
+    logits is (B, H, c, T); keep_b is the causal boolean mask (1, 1, c, T).
+    Softmax runs over the attendable keys of each row (masked keys get -inf and
+    so receive exactly zero probability), then entropy is S = -sum p log p.
+    torch.special.entr applies the 0 log 0 = 0 convention without producing
+    NaNs. Returns (B, H, c).
+    """
+    masked_logits = logits.masked_fill(~keep_b, float("-inf"))
+    probs = torch.softmax(masked_logits, dim=-1)
+    return torch.special.entr(probs).sum(dim=-1)
+
+
+def assert_row_entropy_correct():
+    """Verify _row_entropy against closed-form values on known distributions.
+
+    Two checks that pin the entropy convention without a model:
+      - Flat logits over n attendable keys give a uniform softmax, whose entropy
+        is exactly log(n). Row i (0-indexed, causal) attends to i+1 keys, so its
+        entropy must be log(i+1).
+      - A logit spike on one key drives the softmax to near-one-hot, whose
+        entropy must be ~0. This also exercises the 0 log 0 = 0 path, which must
+        not produce NaN.
+    """
+    import math
+
+    T = 6
+    rows = torch.arange(T).unsqueeze(1)
+    cols = torch.arange(T).unsqueeze(0)
+    keep_b = (cols <= rows).view(1, 1, T, T)
+
+    flat = _row_entropy(torch.zeros(1, 1, T, T), keep_b)[0, 0]
+    for i in range(T):
+        expected = math.log(i + 1)
+        assert abs(flat[i].item() - expected) < 1e-5, (
+            f"flat-logit entropy at row {i} was {flat[i].item()}, "
+            f"expected log({i + 1}) = {expected}"
+        )
+
+    peaked = torch.zeros(1, 1, T, T)
+    peaked[0, 0, :, 0] = 50.0
+    ent = _row_entropy(peaked, keep_b)[0, 0]
+    assert not torch.isnan(ent).any(), "entropy produced NaN (0 log 0 path)"
+    assert ent.max().item() < 1e-3, (
+        f"near-one-hot entropy should be ~0, got max {ent.max().item()}"
+    )
+    return True
+
+
 def _logit_stats(q, k, scaling, want_per_position):
     """Post-RoPE attention logits, reduced.
 
@@ -220,6 +275,24 @@ def _logit_stats(q, k, scaling, want_per_position):
     per_pos_max = [] if want_per_position else None
     per_pos_mean = [] if want_per_position else None
 
+    # Per-head attention entropy accumulation. Entropy is a property of the
+    # softmax over each query row, so it must be computed row by row inside the
+    # chunk loop, on the causally masked logits, before the full matrix is
+    # discarded. Collected per head, then reduced to mean and min across query
+    # rows: the mean is the head's typical sharpness, the min catches a head
+    # that is healthy on average but collapses to near-one-hot at some rows,
+    # which a mean alone would hide.
+    #
+    # Only rows with at least ENTROPY_MIN_CONTEXT attendable keys are counted.
+    # Early rows can attend to only a handful of keys (row 0 to exactly one), so
+    # their entropy is near zero by causal structure, not by collapse. Including
+    # them would make entropy_min trivially zero for every head and destroy its
+    # diagnostic value. The floor restricts the statistic to positions where a
+    # low entropy actually means the head chose to be sharp.
+    ent_sum = torch.zeros(H, dtype=torch.float64)
+    ent_count = 0
+    ent_min = torch.full((H,), float("inf"), dtype=torch.float64)
+
     for start in range(0, T, chunk):
         end = min(start + chunk, T)
         q_chunk = q[:, :, start:end, :].float()          # (B, H, c, D)
@@ -241,6 +314,20 @@ def _logit_stats(q, k, scaling, want_per_position):
         # values is unnecessary for the overflow claim.
         abs_samples.append(finite.abs()[:: max(1, finite.numel() // 100_000)])
 
+        # Per-head entropy for this chunk. See _row_entropy; restricted below
+        # to rows with enough attendable context.
+        row_entropy = _row_entropy(logits, keep_b)  # (B, H, c), nats
+
+        # Restrict to rows with enough attendable context (absolute position
+        # >= ENTROPY_MIN_CONTEXT). row_ctx counts attendable keys per row.
+        row_ctx = keep.sum(dim=-1)                       # (c,)
+        enough = row_ctx >= ENTROPY_MIN_CONTEXT          # (c,)
+        if enough.any():
+            re = row_entropy[:, :, enough]               # (B, H, c')
+            ent_sum += re.sum(dim=(0, 2)).double()
+            ent_count += re.shape[0] * re.shape[2]
+            ent_min = torch.minimum(ent_min, re.amin(dim=(0, 2)).double())
+
         if want_per_position:
             masked = logits.masked_fill(~keep_b, float("nan"))
             per_pos_max.extend(
@@ -253,10 +340,26 @@ def _logit_stats(q, k, scaling, want_per_position):
         del logits
 
     abs_all = torch.cat(abs_samples)
+
+    # If no row met the context floor (short prompts in the aggregate regime),
+    # entropy is undefined for this pass. Emit null rather than inf/NaN, which
+    # are not valid JSON, and let the consumer skip them.
+    if ent_count > 0:
+        entropy_mean = (ent_sum / ent_count).tolist()
+        entropy_min = ent_min.tolist()
+    else:
+        entropy_mean = None
+        entropy_min = None
+
     out = {
         "abs_max": running_absmax,
         "mean": running_sum / running_count,
         "p99_abs": torch.quantile(abs_all.float(), 0.99).item(),
+        # Per-head entropy in nats over rows with >= ENTROPY_MIN_CONTEXT keys.
+        # mean = typical sharpness, min = worst (most collapsed) qualifying row.
+        # null when no row qualified (short-prompt aggregate samples).
+        "entropy_mean_per_head": entropy_mean,
+        "entropy_min_per_head": entropy_min,
     }
     if want_per_position:
         out["per_position_max"] = per_pos_max
